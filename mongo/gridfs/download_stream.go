@@ -124,6 +124,10 @@ func (ds *DownloadStream) Skip(skip int64) (int64, error) {
 		return 0, nil
 	}
 
+	if skip < 0 {
+		return 0, errors.New("negative skip")
+	}
+
 	ctx, cancel := deadlineContext(ds.readDeadline)
 	if cancel != nil {
 		defer cancel()
@@ -132,8 +136,28 @@ func (ds *DownloadStream) Skip(skip int64) (int64, error) {
 	var skipped int64
 	var err error
 
-	for skipped < skip {
-		if ds.bufferStart == 0 {
+	for {
+		toSkip := skip - skipped
+		if toSkip == 0 {
+			break
+		}
+		if bufferSkip := ds.bufferEnd - ds.bufferStart; bufferSkip > 0 {
+			// Skip data in buffer
+			if toSkip <= int64(bufferSkip) {
+				bufferSkip = int(toSkip)
+			}
+			ds.bufferStart += bufferSkip
+			skipped += int64(bufferSkip)
+		} else if toSkip > int64(ds.chunkSize) {
+			// Skip entire chunk
+			if !ds.cursor.Next(ctx) {
+				ds.done = true
+				return skipped, nil
+			}
+			ds.expectedChunk++
+			skipped += int64(ds.chunkSize)
+		} else if toSkip > 0 {
+			// Load new chunk and skip part of it
 			err = ds.fillBuffer(ctx)
 			if err != nil {
 				if err == errNoMoreChunks {
@@ -142,20 +166,11 @@ func (ds *DownloadStream) Skip(skip int64) (int64, error) {
 
 				return skipped, err
 			}
-		}
 
-		// try to skip whole chunk if possible
-		toSkip := 0
-		if skip-skipped < int64(len(ds.buffer)) {
-			// can skip whole chunk
-			toSkip = len(ds.buffer)
-		} else {
-			// can only skip part of buffer
-			toSkip = int(skip - skipped)
+			// Advance in buffer
+			ds.bufferStart += int(toSkip)
+			skipped += toSkip
 		}
-
-		skipped += int64(toSkip)
-		ds.bufferStart = (ds.bufferStart + toSkip) % (int(ds.chunkSize))
 	}
 
 	return skip, nil
